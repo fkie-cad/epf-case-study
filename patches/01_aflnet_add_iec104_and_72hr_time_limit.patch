@@ -1,0 +1,380 @@
+diff --git a/afl-fuzz.c b/afl-fuzz.c
+index 50a2e0d..5f286f7 100644
+--- a/afl-fuzz.c
++++ b/afl-fuzz.c
+@@ -202,6 +202,8 @@ EXP_ST u64 total_crashes,             /* Total number of crashes          */
+ 
+ static u32 subseq_tmouts;             /* Number of timeouts in a row      */
+ 
++static unsigned int init_time;
++
+ static u8 *stage_name = "init",       /* Name of the current fuzz stage   */
+           *stage_short,               /* Short stage name                 */
+           *syncing_party;             /* Currently syncing with...        */
+@@ -409,6 +411,18 @@ kliter_t(lms) *M2_prev, *M2_next;
+ unsigned int* (*extract_response_codes)(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref) = NULL;
+ region_t* (*extract_requests)(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref) = NULL;
+ 
++
++/* Handle stop signal (Ctrl-C, etc). */
++
++static void handle_stop_sig(int sig) {
++
++  stop_soon = 1;
++
++  if (child_pid > 0) kill(child_pid, SIGKILL);
++  if (forksrv_pid > 0) kill(forksrv_pid, SIGKILL);
++
++}
++
+ /* Initialize the implemented state machine as a graphviz graph */
+ void setup_ipsm()
+ {
+@@ -1869,10 +1883,8 @@ static u32 count_non_255_bytes(u8* mem) {
+   }
+ 
+   return ret;
+-
+ }
+ 
+-
+ /* Destructively simplify trace by eliminating hit count information
+    and replacing it with 0x80 or 0x01 depending on whether the tuple
+    is hit or not. Called on every new crash or timeout, should be
+@@ -2037,9 +2049,7 @@ static inline void classify_counts(u32* mem) {
+ /* Get rid of shared memory (atexit handler). */
+ 
+ static void remove_shm(void) {
+-
+   shmctl(shm_id, IPC_RMID, NULL);
+-
+ }
+ 
+ 
+@@ -4324,13 +4334,15 @@ static void write_stats_file(double bitmap_cvg, double stability, double eps) {
+ 
+ static void maybe_update_plot_file(double bitmap_cvg, double eps) {
+ 
+-  static u32 prev_qp, prev_pf, prev_pnf, prev_ce, prev_md;
+-  static u64 prev_qc, prev_uc, prev_uh;
++  static u32 prev_qp, prev_pf, prev_pnf, prev_ce, prev_md, curr_cov;
++  static u64 prev_qc, prev_uc, prev_uh, prev_cov;
+ 
++
++  curr_cov = count_non_255_bytes(virgin_bits);
+   if (prev_qp == queued_paths && prev_pf == pending_favored &&
+       prev_pnf == pending_not_fuzzed && prev_ce == current_entry &&
+       prev_qc == queue_cycle && prev_uc == unique_crashes &&
+-      prev_uh == unique_hangs && prev_md == max_depth) return;
++      prev_uh == unique_hangs && prev_md == max_depth && curr_cov <= prev_cov) return;
+ 
+   prev_qp  = queued_paths;
+   prev_pf  = pending_favored;
+@@ -4340,6 +4352,7 @@ static void maybe_update_plot_file(double bitmap_cvg, double eps) {
+   prev_uc  = unique_crashes;
+   prev_uh  = unique_hangs;
+   prev_md  = max_depth;
++  prev_cov = curr_cov;
+ 
+   /* Fields in the file:
+ 
+@@ -4348,10 +4361,10 @@ static void maybe_update_plot_file(double bitmap_cvg, double eps) {
+      execs_per_sec */
+ 
+   fprintf(plot_file,
+-          "%llu, %llu, %u, %u, %u, %u, %0.02f%%, %llu, %llu, %u, %0.02f\n",
++          "%llu, %llu, %u, %u, %u, %u, %0.02f%%, %llu, %llu, %u, %0.02f, %u\n",
+           get_cur_time() / 1000, queue_cycle - 1, current_entry, queued_paths,
+           pending_not_fuzzed, pending_favored, bitmap_cvg, unique_crashes,
+-          unique_hangs, max_depth, eps); /* ignore errors */
++          unique_hangs, max_depth, eps, curr_cov); /* ignore errors */
+ 
+   fflush(plot_file);
+ 
+@@ -5453,6 +5466,8 @@ EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
+   //Update fuzz count, no matter whether the generated test is interesting or not
+   if (state_aware_mode) update_fuzzs();
+ 
++  if ((unsigned)time(NULL) - init_time >= 259200) handle_stop_sig(1); //72 hrs
++ //if ((unsigned)time(NULL) - init_time >= 15) handle_stop_sig(1);
+   if (stop_soon) return 1;
+ 
+   if (fault == FAULT_TMOUT) {
+@@ -7747,18 +7762,6 @@ static void sync_fuzzers(char** argv) {
+ }
+ 
+ 
+-/* Handle stop signal (Ctrl-C, etc). */
+-
+-static void handle_stop_sig(int sig) {
+-
+-  stop_soon = 1;
+-
+-  if (child_pid > 0) kill(child_pid, SIGKILL);
+-  if (forksrv_pid > 0) kill(forksrv_pid, SIGKILL);
+-
+-}
+-
+-
+ /* Handle skip request (SIGUSR1). */
+ 
+ static void handle_skipreq(int sig) {
+@@ -8216,7 +8219,7 @@ EXP_ST void setup_dirs_fds(void) {
+ 
+   fprintf(plot_file, "# unix_time, cycles_done, cur_path, paths_total, "
+                      "pending_total, pending_favs, map_size, unique_crashes, "
+-                     "unique_hangs, max_depth, execs_per_sec\n");
++                     "unique_hangs, max_depth, execs_per_sec, byte_cov\n");
+                      /* ignore errors */
+ 
+ }
+@@ -8968,6 +8971,9 @@ int main(int argc, char** argv) {
+         } else if (!strcmp(optarg, "TLS")) {
+           extract_requests = &extract_requests_tls;
+           extract_response_codes = &extract_response_codes_tls;
++        } else if (!strcmp(optarg, "IEC104")) {
++          extract_requests = &extract_requests_iec104;
++          extract_response_codes = &extract_response_codes_iec104;
+         } else {
+           FATAL("%s protocol is not supported yet!", optarg);
+         }
+@@ -9098,6 +9104,7 @@ int main(int argc, char** argv) {
+   check_binary(argv[optind]);
+ 
+   start_time = get_cur_time();
++  init_time = (unsigned)time(NULL);
+ 
+   if (qemu_mode)
+     use_argv = get_qemu_argv(argv[0], argv + optind, argc - optind);
+diff --git a/aflnet-replay.c b/aflnet-replay.c
+index 1dc86fc..9ab8bbc 100644
+--- a/aflnet-replay.c
++++ b/aflnet-replay.c
+@@ -44,6 +44,7 @@ int main(int argc, char* argv[])
+   else if (!strcmp(argv[2], "SMTP")) extract_response_codes = &extract_response_codes_smtp;
+   else if (!strcmp(argv[2], "SSH")) extract_response_codes = &extract_response_codes_ssh;
+   else if (!strcmp(argv[2], "TLS")) extract_response_codes = &extract_response_codes_tls;
++  else if (!strcmp(argv[2], "IEC104")) extract_response_codes = &extract_response_codes_iec104;
+   else {fprintf(stderr, "[AFLNet-replay] Protocol %s has not been supported yet!\n", argv[2]); exit(1);}
+ 
+   portno = atoi(argv[3]);
+diff --git a/aflnet.c b/aflnet.c
+index 4278987..c9c12e5 100644
+--- a/aflnet.c
++++ b/aflnet.c
+@@ -577,6 +577,42 @@ region_t* extract_requests_ftp(unsigned char* buf, unsigned int buf_size, unsign
+   return regions;
+ }
+ 
++region_t* extract_requests_iec104(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref)
++{
++    // DONE
++    unsigned int region_count = 0;
++    region_t *regions = NULL;
++
++    for (unsigned int byte_count = 0; byte_count < buf_size; byte_count++) {
++        if (*(buf + byte_count) == 0x68 &&                              //     each APDU starts with START = 0x68 ...
++                byte_count + 5 < buf_size) {                            // ... is at least 6 byte long (I/S/U header) ...
++            unsigned char len = (unsigned char)(*(buf + byte_count + 1));
++            if (len >= 0x04 &&                                          // ... has a length field value of at least 4 ...
++                    byte_count + 1 + len < buf_size) {                  // ... and should be complete within the buffer
++
++                // valid packet
++                region_count++;
++                regions = (region_t *)ck_realloc(regions, region_count * sizeof(region_t));
++                regions[region_count - 1].start_byte = byte_count;
++                regions[region_count - 1].end_byte = byte_count + 1 + len;
++                regions[region_count - 1].state_sequence = NULL;
++                regions[region_count - 1].state_count = 0;
++                byte_count += 1 + len;
++            }
++        }
++    }
++    if ((region_count == 0) && (buf_size > 0)) {
++        regions = (region_t *)ck_realloc(regions, sizeof(region_t));
++        regions[0].start_byte = 0;
++        regions[0].end_byte = buf_size - 1;
++        regions[0].state_sequence = NULL;
++        regions[0].state_count = 0;
++        region_count = 1;
++    }
++    *region_count_ref = region_count;
++    return regions;
++}
++
+ unsigned int* extract_response_codes_smtp(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref)
+ {
+   char *mem;
+@@ -819,6 +855,33 @@ unsigned int* extract_response_codes_dns(unsigned char* buf, unsigned int buf_si
+   return state_sequence;
+ }
+ 
++unsigned int* extract_response_codes_iec104(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref)
++{
++    // TODO
++    unsigned int *state_sequence = NULL;
++    unsigned int state_count = 0;
++
++    state_count++;
++    state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
++    state_sequence[state_count - 1] = 0;
++    for (unsigned int byte_count = 0; byte_count < buf_size; byte_count++) {
++        if (*(buf + byte_count) == 0x68 &&                              //     each APDU starts with START = 0x68 ...
++                byte_count + 5 < buf_size) {                            // ... is at least 6 byte long (I/S/U header) ...
++            unsigned char len = (unsigned char)(*(buf + byte_count + 1));
++            if (len >= 0x04 &&                                          // ... has a length field value of at least 4 ...
++                    byte_count + 1 + len < buf_size) {                  // ... and should be complete within the buffer
++                // pseudo response... is the APDU type indicator control field + optional U-field bitstring
++                unsigned int pseudo_response = (unsigned int)(*(buf + byte_count + 2));
++                state_count++;
++                state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
++                state_sequence[state_count - 1] = pseudo_response;
++            }
++        }
++    }
++    *state_count_ref = state_count;
++    return state_sequence;
++}
++
+ static unsigned char dtls12_version[2] = {0xFE, 0xFD};
+ 
+ // (D)TLS known and custom constants
+@@ -1154,7 +1217,7 @@ void delete_kl_messages(klist_t(lms) *kl_messages)
+   }
+ 
+   /* Finally, destroy the list */
+-	kl_destroy(lms, kl_messages);
++    kl_destroy(lms, kl_messages);
+ }
+ 
+ kliter_t(lms) *get_last_message(klist_t(lms) *kl_messages)
+@@ -1182,7 +1245,7 @@ u32 save_kl_messages_to_file(klist_t(lms) *kl_messages, u8 *fname, u8 replay_ena
+   for (it = kl_begin(kl_messages); it != kl_end(kl_messages) && message_count < max_count; it = kl_next(it)) {
+     message_size = kl_val(it)->msize;
+     if (replay_enabled) {
+-		  mem = (u8 *)ck_realloc(mem, 4 + len + message_size);
++          mem = (u8 *)ck_realloc(mem, 4 + len + message_size);
+ 
+       //Save packet size first
+       u32 *psize = (u32*)&mem[len];
+@@ -1327,55 +1390,55 @@ void save_regions_to_file(region_t *regions, unsigned int region_count, unsigned
+ 
+ int str_split(char* a_str, const char* a_delim, char **result, int a_count)
+ {
+-	char *token;
+-	int count = 0;
+-
+-	/* count number of tokens */
+-	/* get the first token */
+-	char* tmp1 = strdup(a_str);
+-	token = strtok(tmp1, a_delim);
+-
+-	/* walk through other tokens */
+-	while (token != NULL)
+-	{
+-		count++;
+-		token = strtok(NULL, a_delim);
+-	}
+-
+-	if (count != a_count)
+-	{
+-		return 1;
+-	}
+-
+-	/* split input string, store tokens into result */
+-	count = 0;
+-	/* get the first token */
+-	token = strtok(a_str, a_delim);
+-
+-	/* walk through other tokens */
+-
+-	while (token != NULL)
+-	{
+-		result[count] = token;
+-		count++;
+-		token = strtok(NULL, a_delim);
+-	}
+-
+-	free(tmp1);
+-	return 0;
++    char *token;
++    int count = 0;
++
++    /* count number of tokens */
++    /* get the first token */
++    char* tmp1 = strdup(a_str);
++    token = strtok(tmp1, a_delim);
++
++    /* walk through other tokens */
++    while (token != NULL)
++    {
++        count++;
++        token = strtok(NULL, a_delim);
++    }
++
++    if (count != a_count)
++    {
++        return 1;
++    }
++
++    /* split input string, store tokens into result */
++    count = 0;
++    /* get the first token */
++    token = strtok(a_str, a_delim);
++
++    /* walk through other tokens */
++
++    while (token != NULL)
++    {
++        result[count] = token;
++        count++;
++        token = strtok(NULL, a_delim);
++    }
++
++    free(tmp1);
++    return 0;
+ }
+ 
+ void str_rtrim(char* a_str)
+ {
+-	char* ptr = a_str;
+-	int count = 0;
+-	while ((*ptr != '\n') && (*ptr != '\t') && (*ptr != ' ') && (count < strlen(a_str))) {
+-		ptr++;
+-		count++;
+-	}
+-	if (count < strlen(a_str)) {
+-		*ptr = '\0';
+-	}
++    char* ptr = a_str;
++    int count = 0;
++    while ((*ptr != '\n') && (*ptr != '\t') && (*ptr != ' ') && (count < strlen(a_str))) {
++        ptr++;
++        count++;
++    }
++    if (count < strlen(a_str)) {
++        *ptr = '\0';
++    }
+ }
+ 
+ int parse_net_config(u8* net_config, u8* protocol, u8** ip_address, u32* port)
+diff --git a/aflnet.h b/aflnet.h
+index 7bfcd17..8ebc863 100644
+--- a/aflnet.h
++++ b/aflnet.h
+@@ -66,6 +66,7 @@ unsigned int* extract_response_codes_dns(unsigned char* buf, unsigned int buf_si
+ unsigned int* extract_response_codes_ftp(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref);
+ unsigned int* extract_response_codes_rtsp(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref);
+ unsigned int* extract_response_codes_dtls12(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref);
++unsigned int* extract_response_codes_iec104(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref);
+ extern unsigned int* (*extract_response_codes)(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref);
+ 
+ region_t* extract_requests_smtp(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref);
+@@ -76,6 +77,7 @@ region_t* extract_requests_dns(unsigned char* buf, unsigned int buf_size, unsign
+ region_t* extract_requests_ftp(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref);
+ region_t* extract_requests_rtsp(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref);
+ region_t* extract_requests_dtls12(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref);
++region_t* extract_requests_iec104(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref);
+ extern region_t* (*extract_requests)(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref);
+ 
+ // Network communication functions
