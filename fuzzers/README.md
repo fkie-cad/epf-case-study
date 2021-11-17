@@ -8,5 +8,5 @@ The corresponding subfolders are git submodules. They must be initialized by our
 | Fuzzer | git revision                                                                                |
 | ------ | ------------------------------------------------------------------------------------------- |
 | AFLNet | [`abf1f8b`](https://github.com/aflnet/aflnet/tree/abf1f8b3bf2ea027edfa636c74d04471dff6dbed) |
-| EPF    | [`b08334b`](https://github.com/rhelmke/epf/tree/b08334bbf2f506c00773dc8f4e5756205bd7d21a)   |
+| EPF    | [`5c19484`](https://github.com/fkie-cad/epf/tree/5c194842e162b4068fdc6fe97a04a2e0e5d180b9)  |
 
